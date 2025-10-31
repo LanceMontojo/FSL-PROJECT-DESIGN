@@ -14,13 +14,26 @@
       <div class="col-lg-7 position-relative">
         <div class="card shadow-sm border-0 h-100 rounded-4 position-relative overflow-hidden">
           <video id="cam" autoplay playsinline muted
-                 style="width:100%;height:100%;background:#000;aspect-ratio:4/3;border-radius:1rem;transform:scaleX(-1);"></video>
-          <canvas id="overlay" style="position:absolute;inset:0;border-radius:1rem;pointer-events:none;"></canvas>
+                 style="width:100%;height:100%;background:#000;aspect-ratio:4/3;
+                        border-radius:1rem;transform:scaleX(-1);object-fit:cover;"></video>
+          <canvas id="overlay" style="position:absolute;inset:0;pointer-events:none;"></canvas>
+
+          <!-- LIVE -->
           <div id="recBadge"
                class="position-absolute top-0 start-0 m-3 px-3 py-1 rounded-pill fw-bold"
-               style="display:none;z-index:9;background:#b10000;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.3);">
+               style="display:none;z-index:11;background:#b10000;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.3);">
             ● LIVE
           </div>
+
+          <!-- RESULT (TOP-LEFT) -->
+          <div id="gestureOverlay"
+               class="position-absolute top-0 start-0 m-3 px-3 py-2 rounded-3 fw-bold text-white shadow"
+               style="display:none;z-index:12;background:rgba(0,0,0,.75);">—</div>
+
+          <!-- TIMER (TOP-RIGHT) -->
+          <div id="timerOverlay"
+               class="position-absolute top-0 end-0 m-3 px-3 py-2 rounded-3 fw-bold text-white shadow text-center"
+               style="display:none;z-index:12;background:#0d6efd;font-size:1.2rem;">5</div>
         </div>
       </div>
 
@@ -30,14 +43,25 @@
           <h6 class="text-muted mb-1">Detected Gesture</h6>
           <p id="detLabel" class="fs-4 text-primary fw-bold mb-0">—</p>
           <p id="detStatus" class="fs-5 fw-bold text-secondary mt-2">Idle</p>
-          <!-- Frame counter hidden -->
           <p id="frameInfo" class="text-muted mb-1" style="display:none;">Frames Captured: 0</p>
 
           <hr>
           <h6 class="text-muted mb-2">Recognition Settings</h6>
+
           <label class="d-flex justify-content-between align-items-center mb-3">
             <span>🖐 Show Landmarks & Bounding Boxes</span>
             <input type="checkbox" id="toggleVisuals" checked>
+          </label>
+
+          <label class="d-flex justify-content-between align-items-center mb-3">
+            <span>🕒 Show Timer & Result Overlay</span>
+            <input type="checkbox" id="toggleOverlays" checked>
+          </label>
+
+          <!-- 🔥 New Fast Mode -->
+          <label class="d-flex justify-content-between align-items-center mb-3">
+            <span>⚡ Fast Signer Mode (3s predictions)</span>
+            <input type="checkbox" id="toggleSpeed">
           </label>
 
           <hr>
@@ -79,11 +103,15 @@
   const stateBadge=document.getElementById('stateBadge');
   const frameInfo=document.getElementById('frameInfo');
   const toggleVisuals=document.getElementById('toggleVisuals');
+  const toggleOverlays=document.getElementById('toggleOverlays');
+  const toggleSpeed=document.getElementById('toggleSpeed');
+  const gestureOverlay=document.getElementById('gestureOverlay');
+  const timerOverlay=document.getElementById('timerOverlay');
 
   const PREDICT_URL=location.origin+'/predict_auto';
   const SEQ_LEN=48;
-  let buf=[],running=false,handsPresent=false,frameCount=0,showVisuals=true;
-  let predictInterval=null;
+  let buf=[],running=false,handsPresent=false,frameCount=0,showVisuals=true,showOverlays=true;
+  let predictInterval=null, tickInterval=null, countdown=5;
 
   // --- helpers ---
   function flattenHand(lms){if(!lms)return new Float32Array(63);const a=[];for(let i=0;i<21;i++){const p=lms[i];a.push(p.x,p.y,p.z);}return new Float32Array(a);}
@@ -139,11 +167,10 @@
     ctx.drawImage(res.image,0,0,canvasEl.width,canvasEl.height);
     const RH=res.rightHandLandmarks, LH=res.leftHandLandmarks;
     handsPresent=!!(RH||LH);
-
     if(showVisuals && handsPresent){
       const drawBox=(h,color)=>{
         let minX=1,minY=1,maxX=0,maxY=0;
-        h.forEach(p=>{if(p.x<minX)minX=p.x;if(p.x>maxX)maxX=p.x;if(p.y<minY)minY=p.y;if(p.y>maxY)maxY=p.y;});
+        h.forEach(p=>{minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);});
         ctx.strokeStyle=color;ctx.lineWidth=3;
         ctx.strokeRect(minX*canvasEl.width,minY*canvasEl.height,(maxX-minX)*canvasEl.width,(maxY-minY)*canvasEl.height);
         h.forEach(p=>{ctx.beginPath();ctx.arc(p.x*canvasEl.width,p.y*canvasEl.height,4,0,2*Math.PI);ctx.fillStyle=color;ctx.fill();});
@@ -155,7 +182,7 @@
     const feat=packFeature(res);
     if (running && feat) {
       buf.push(feat);
-      if (buf.length > SEQ_LEN) buf.shift(); // keep only latest 48 frames
+      if (buf.length > SEQ_LEN) buf.shift();
       frameCount = buf.length;
       frameInfo.textContent = 'Frames Captured: ' + frameCount;
     }
@@ -165,78 +192,86 @@
 
   // --- prediction ---
   async function predict(){
-    if(buf.length<5)return;
+    if(buf.length<5) return;
     const fixed=temporalFix(buf,SEQ_LEN);
     const seq=fixed.flatMap(f=>Array.from(f));
     try{
-      const res=await fetch(PREDICT_URL,{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({sequence:seq})
-      });
+      const res=await fetch(PREDICT_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sequence:seq})});
       const j=await res.json();
-
+      if(!showOverlays)return;
       if(j.prediction==='Incorrect'){
-        detLabel.textContent=j.message || '❌ Incorrect gesture';
-        detStatus.textContent='❌ Incorrect';
-        detStatus.className='fs-5 fw-bold text-danger';
-        addHistory(`❌ Closest: ${j.closest_sign}`,false);
+        gestureOverlay.textContent=`❌ Incorrect — Closest: ${j.closest_sign||'—'}`;
+        gestureOverlay.style.display='block';
+        gestureOverlay.style.background='rgba(200,0,0,0.8)';
       } else {
-        detLabel.textContent=j.message || j.prediction;
-        detStatus.textContent='✅ Correct';
-        detStatus.className='fs-5 fw-bold text-success';
-        addHistory(`✅ ${j.prediction}`, true);
+        gestureOverlay.textContent=`✅ Correct — ${j.prediction||'—'}`;
+        gestureOverlay.style.display='block';
+        gestureOverlay.style.background='rgba(0,140,60,0.8)';
       }
-
     }catch(e){
-      detStatus.textContent='⚠ Prediction error';
-      detStatus.className='fs-5 fw-bold text-warning';
+      gestureOverlay.textContent='⚠ Prediction error';
+      gestureOverlay.style.display='block';
+      gestureOverlay.style.background='rgba(255,140,0,0.8)';
     }
   }
 
-  function addHistory(text,ok){
-    const line=document.createElement('div');
-    line.textContent=`${new Date().toLocaleTimeString()} ${text}`;
-    historyEl.querySelector('.text-muted')?.remove();
-    historyEl.prepend(line);
-    while(historyEl.children.length>12)historyEl.lastChild.remove();
-  }
-
+  // --- toggles ---
   toggleVisuals.onchange=()=>{showVisuals=toggleVisuals.checked;};
+  toggleOverlays.onchange=()=>{showOverlays=toggleOverlays.checked;
+    gestureOverlay.style.display=showOverlays?'block':'none';
+    timerOverlay.style.display=showOverlays?'block':'none';
+  };
 
-  // --- continuous prediction mode ---
-  startBtn.onclick=async()=>{
-    if(running)return;
-    running=true;buf=[];frameCount=0;
-    detLabel.textContent='—';detStatus.textContent='Detecting Hands...';
-    detStatus.className='fs-5 fw-bold text-secondary';
-    recBadge.style.display='inline-block';
-    stateBadge.textContent='State: LIVE';
+  // --- controls ---
+  startBtn.onclick = async () => {
+    if (running) return;
+    running = true;
+    buf = [];
+    frameCount = 0;
+    recBadge.style.display = 'inline-block';
+    stateBadge.textContent = 'State: LIVE';
     await camera.start();
-    startBtn.style.display='none';
-    stopBtn.style.display='inline-block';
+    startBtn.style.display = 'none';
+    stopBtn.style.display = 'inline-block';
 
-    // Predict every 5 seconds
-    predictInterval=setInterval(async()=>{
-      if(buf.length>=10) await predict();
-    },5000);
+    // ⏱ check if fast signer mode is on
+    const fastMode = toggleSpeed.checked;
+    const intervalMs = fastMode ? 3000 : 5000;
+    countdown = fastMode ? 3 : 5;
+
+    timerOverlay.textContent = countdown;
+    timerOverlay.style.display = showOverlays ? 'block' : 'none';
+
+    // countdown colors
+    tickInterval = setInterval(() => {
+      countdown--;
+      if (countdown <= 0) countdown = fastMode ? 3 : 5;
+      timerOverlay.textContent = countdown;
+      if (countdown <= 1) timerOverlay.style.background = '#dc3545'; // red
+      else if (countdown <= 2) timerOverlay.style.background = '#fd7e14'; // orange
+      else timerOverlay.style.background = '#0d6efd'; // blue
+    }, 1000);
+
+    // 🔥 run first prediction quickly, then repeat
+    setTimeout(() => { predict(); }, 1000);
+    predictInterval = setInterval(predict, intervalMs);
   };
 
   stopBtn.onclick=async()=>{
     running=false;
     recBadge.style.display='none';
     stateBadge.textContent='State: STOPPED';
-    clearInterval(predictInterval);
-    predictInterval=null;
+    clearInterval(predictInterval);clearInterval(tickInterval);
+    timerOverlay.style.display='none';
+    gestureOverlay.style.display='none';
     try{await camera.stop();}catch(_){}
-    stopBtn.style.display='none';
-    startBtn.style.display='inline-block';
+    stopBtn.style.display='none';startBtn.style.display='inline-block';
   };
 
   clearBtn.onclick=()=>{historyEl.innerHTML='<div class="text-muted">No predictions yet…</div>';};
 
   function resize(){canvasEl.width=videoEl.clientWidth;canvasEl.height=videoEl.clientHeight;}
-  new ResizeObserver(resize).observe(videoEl);resize();
+  new ResizeObserver(resize).observe(videoEl); resize();
 })();
 </script>
 
