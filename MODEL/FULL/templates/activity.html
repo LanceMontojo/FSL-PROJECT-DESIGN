@@ -69,11 +69,21 @@
     </div>
 
     <div class="card border-0 shadow-sm rounded-4 p-4 mb-4 text-center bg-white">
-      <div class="mb-3">
+      <div class="mb-3" id="categoryBar">
         <button class="btn btn-outline-primary mx-2 fw-semibold category-btn" data-cat="numbers">🔢 Numbers</button>
         <button class="btn btn-outline-primary mx-2 fw-semibold category-btn" data-cat="family">👨‍👩‍👧‍👦 Family</button>
         <button class="btn btn-outline-primary mx-2 fw-semibold category-btn" data-cat="colors">🎨 Colors</button>
       </div>
+
+      <div class="text-center mb-3">
+        <label class="fw-semibold me-2">Difficulty:</label>
+        <select id="difficultySelect" class="form-select d-inline-block w-auto">
+          <option value="easy" selected>🟢 Easy</option>
+          <option value="random">🟡 Random</option>
+          <option value="compound">🔴 Compound</option>
+        </select>
+      </div>
+
       <div id="gestureChoices" class="mt-3"></div>
     </div>
 
@@ -91,6 +101,19 @@
 <script>
 window.addEventListener("load", () => {
   const STATIC_BASE = (window.location.origin + '/static/video').replace(/\/+$/, '');
+
+  const difficultySelect = document.getElementById("difficultySelect");
+
+  function pickRandomSign() {
+    const all = [...categories.colors, ...categories.family, ...categories.numbers];
+    return all[Math.floor(Math.random() * all.length)];
+  }
+
+  function pickCompoundSign() {
+    const num = categories.numbers[Math.floor(Math.random() * categories.numbers.length)];
+    const color = categories.colors[Math.floor(Math.random() * categories.colors.length)];
+    return `${num} + ${color}`;
+  }
 
   const videoEl = document.getElementById("mainCamera");
   const canvasEl = document.getElementById("overlayCanvas");
@@ -121,6 +144,29 @@ window.addEventListener("load", () => {
   const btnShowHow = document.getElementById("btnShowHow");
   const btnTryAgain = document.getElementById("btnTryAgain");
   const assistHint = document.getElementById("assistHint");
+
+  const gestureChoices = document.getElementById("gestureChoices");
+  const categoryBar = document.getElementById("categoryBar");
+
+  // Hide/show category UI based on difficulty
+  function applyDifficultyUI(mode){
+    const catButtons = document.querySelectorAll(".category-btn");
+    if (mode === "random" || mode === "compound") {
+      gestureChoices.style.display = "none";
+      catButtons.forEach(btn => btn.style.display = "none");
+      categoryBar.style.display = "none";
+    } else {
+      gestureChoices.style.display = "block";
+      catButtons.forEach(btn => btn.style.display = "inline-block");
+      categoryBar.style.display = "block";
+    }
+  }
+
+  difficultySelect.addEventListener("change", () => {
+    applyDifficultyUI(difficultySelect.value);
+    assistRow.style.display = "none";
+  });
+  applyDifficultyUI(difficultySelect.value);
 
   const hud = document.createElement("div");
   Object.assign(hud.style, { position: "absolute", right: "10px", bottom: "10px", zIndex: "10", background: "rgba(0,0,0,.55)", color: "#fff", font: "12px/1.2 system-ui,Segoe UI,Roboto,Arial", padding: "6px 8px", borderRadius: "8px", pointerEvents: "none" });
@@ -163,7 +209,9 @@ window.addEventListener("load", () => {
   function setState(s){ state=s; stateBadge.textContent="State: "+["READY","PREP","CAPTURE"][s]; }
 
   let targetGesture=null, correctCount=0, incorrectCount=0;
-  const SEQ_LEN=48, CAPTURE_MAX=120, CAPTURE_MS=5000;
+  const SEQ_LEN = 48, CAPTURE_MAX = 120;
+  const BASE_CAPTURE_MS = 5000;
+  let CAPTURE_MS = BASE_CAPTURE_MS; // 5s default; 10s for compound
   let buf=[], running=false, frameSkip=1, frameCounter=0, autoJudge=false, captureStartMs=0;
 
   document.querySelectorAll(".category-btn").forEach(btn=>{
@@ -283,73 +331,173 @@ window.addEventListener("load", () => {
 
   const PREDICT_URL = location.origin + '/predict';
   async function callPredict(sequence) {
-  const payload = {
-  method:'POST',
-  headers:{ 'Content-Type':'application/json' },
-  body: JSON.stringify({ sequence: sequence })
-};
-  const res = await fetch(PREDICT_URL, payload);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return await res.json();
-  }
-  
-  function parsePrediction(j){
-    let label=j.label;
-    if(!label && j.pred && typeof j.pred==='object') label=j.pred.label||j.pred.class;
-    if(!label && Array.isArray(j.topk) && j.topk.length) label=j.topk[0].label||j.topk[0].class||j.topk[0].name;
-    if(label){ label = normLabel(label.split('_').pop()); }
-    return { label };
+    const payload = {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ sequence: sequence })
+    };
+    const res = await fetch(PREDICT_URL, payload);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
   }
 
-  async function predictOnce(){
-  if (buf.length < 20) { 
-    alert('Not enough data.'); 
-    return; 
+  function extractPredictedLabel(j){
+    let predicted = j?.prediction || j?.label || j?.pred?.label || j?.pred?.class;
+    if (!predicted && Array.isArray(j?.topk) && j.topk.length) {
+      predicted = j.topk[0].label || j.topk[0].class || j.topk[0].name;
+    }
+    if (typeof predicted === "string" && predicted.includes("_")) {
+      predicted = predicted.split("_").pop();
+    }
+    return normLabel(predicted);
   }
 
-  const fixed = temporalFix(buf, SEQ_LEN);
-  const seq = fixed.flatMap(f => Array.from(f));
+  // For Easy/Random: updates UI here; for Compound: return only
+  async function predictOnce(silent=false){
+    if (buf.length < 20) {
+      if (!silent) alert('Not enough data.');
+      return { predicted: null, raw: null };
+    }
+    const fixed = temporalFix(buf, SEQ_LEN);
+    const seq = fixed.flatMap(f => Array.from(f));
 
-  try {
+    try {
       const j = await callPredict(seq);
-      let predicted = j.prediction || j.label || j.pred?.label;
+      const predicted = extractPredictedLabel(j);
 
-      // ✅ Normalize the predicted label to remove prefixes like "Color_", "Family_", "Numbers_"
-      if (predicted && predicted.includes("_")) {
-        predicted = predicted.split("_").pop();
-      }
-      predicted = normLabel(predicted);
-
-      const target = normLabel(targetGesture || '');
-
-      if (predicted && target && predicted === target) {
+      if (difficultySelect.value !== "compound" && !silent) {
+        const target = normLabel(targetGesture || '');
+        if (predicted && target && predicted === target) {
           correctCount++;
           resultText.textContent = '✅ Correct';
           resultText.className = 'fs-4 fw-bold text-success';
           correctCountEl.textContent = String(correctCount);
           assistRow.style.display = 'none';
-      } else {
+        } else {
           incorrectCount++;
           resultText.textContent = '❌ Incorrect';
           resultText.className = 'fs-4 fw-bold text-danger';
           incorrectCountEl.textContent = String(incorrectCount);
           assistRow.style.display = 'block';
           assistHint.textContent = 'Watch the overlay, then try again.';
+        }
       }
-  } catch (e) {
+      return { predicted, raw: j };
+    } catch (e) {
       console.error(e);
-      resultText.textContent = '⚠️ Prediction error';
-      resultText.className = 'fs-4 fw-bold text-warning';
-      assistRow.style.display = 'block';
-      assistHint.textContent = 'Check that the backend is running and reachable.';
+      if (!silent) {
+        resultText.textContent = '⚠️ Prediction error';
+        resultText.className = 'fs-4 fw-bold text-warning';
+        assistRow.style.display = 'block';
+        assistHint.textContent = 'Check that the backend is running and reachable.';
+      }
+      return { predicted: null, raw: null };
+    }
   }
-}
 
-  async function stopAndPredict(){
-    if(state!==STATE_CAPTURE && state!==STATE_PREP) return;
-    running=false; recBadge.style.display='none'; capturePhase.textContent='Predicting…';
-    camera.stop(); await predictOnce();
-    setTimeout(()=>{ setState(STATE_READY); capturePhase.textContent='Idle'; startBtn.style.display='inline-block'; stopBtn.style.display='none'; autoJudge=false; timerBar.style.width='0%'; },200);
+  // ************ FIXED compound flow + non-compound camera behavior ************
+  async function stopAndPredict(isHalfway = false) {
+    if (state !== STATE_CAPTURE && state !== STATE_PREP) return;
+
+    // Halfway (first 5s) — lock so it can’t retrigger
+    if (isHalfway) {
+      if (autoJudge === "lock" || autoJudge === "half_done") return;
+      autoJudge = "lock";
+
+      capturePhase.textContent = "✅ First sign complete — processing...";
+      const firstResult = await predictOnce(true);
+      window.firstCompoundResult = firstResult;
+
+      const [firstExpected, secondExpected] = (targetGesture || "")
+        .split("+")
+        .map(s => normLabel(s.trim()));
+
+      const firstPred = normLabel(firstResult?.predicted);
+      if (firstPred === firstExpected) {
+        resultText.textContent = `✅ First sign correct (${firstExpected})`;
+        resultText.className = "fs-5 fw-bold text-success";
+      } else {
+        resultText.textContent = `❌ First sign incorrect — expected ${firstExpected}`;
+        resultText.className = "fs-5 fw-bold text-danger";
+      }
+
+      // Reset buffer for second half
+      buf = [];
+      frameCounter = 0;
+      frameCountEl.textContent = "0";
+      progressBar.style.width = "0%";
+      timerBar.style.width = "0%";
+
+      setTimeout(() => {
+        autoJudge = "half_done";               // mark first half finished
+        capturePhase.textContent = "Perform second sign (~5 s)…";
+        captureStartMs = Date.now();           // start new 5s window
+      }, 1200);
+
+      return;
+    }
+
+    // Final (after 10s total)
+    if (difficultySelect.value === "compound") {
+      if (autoJudge === "done") return;
+      autoJudge = "done";
+
+      running = false;
+      recBadge.style.display = "none";
+      capturePhase.textContent = "Processing results...";
+      try { await camera.stop(); } catch(_) {}
+
+      const secondResult = await predictOnce(true);
+      const firstResult = window.firstCompoundResult || {};
+
+      const [firstExpected, secondExpected] = (targetGesture || "")
+        .split("+")
+        .map(s => normLabel(s.trim()));
+
+      const firstPred = normLabel(firstResult?.predicted);
+      const secondPred = normLabel(secondResult?.predicted);
+
+      let summary = "";
+      if (firstPred === firstExpected && secondPred === secondExpected) {
+        summary = `✅ Compound correct: ${firstExpected} + ${secondExpected}`;
+        resultText.className = "fs-4 fw-bold text-success";
+        correctCount++;
+      } else if (firstPred === firstExpected && secondPred !== secondExpected) {
+        summary = `❌ Second sign incorrect — expected ${secondExpected}`;
+        resultText.className = "fs-4 fw-bold text-danger";
+        incorrectCount++;
+      } else if (firstPred !== firstExpected && secondPred === secondExpected) {
+        summary = `❌ First sign incorrect — expected ${firstExpected}`;
+        resultText.className = "fs-4 fw-bold text-danger";
+        incorrectCount++;
+      } else {
+        summary = `❌ Both signs incorrect`;
+        resultText.className = "fs-4 fw-bold text-danger";
+        incorrectCount++;
+      }
+
+      resultText.textContent = summary;
+      correctCountEl.textContent = String(correctCount);
+      incorrectCountEl.textContent = String(incorrectCount);
+
+      setState(STATE_READY);
+      capturePhase.textContent = "Idle";
+      startBtn.style.display = "inline-block";
+      stopBtn.style.display = "none";
+      timerBar.style.width = "0%";
+      return;
+    }
+
+    // Non-compound (Easy/Random): do NOT stop the camera; just finalize result and stay previewing
+    running = false;
+    recBadge.style.display = "none";
+    await predictOnce(false);  // updates UI itself
+    setState(STATE_READY);
+    capturePhase.textContent = "Idle";
+    startBtn.style.display = "inline-block";
+    stopBtn.style.display = "none";
+    timerBar.style.width = "0%";
+    // camera keeps running implicitly via Start/Ready preview (no camera.stop() here)
   }
 
   const HAND_CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20]];
@@ -544,14 +692,27 @@ window.addEventListener("load", () => {
     const sd=(isFinite(shL.x)&&isFinite(shR.x))?dist2D(shL,shR).toFixed(3):'nan';
     hud.textContent='ShoulderDist: '+sd;
 
-    if(running && state===STATE_CAPTURE){
+    if (running && state === STATE_CAPTURE) {
       frameCounter++;
-      if(frameCounter%frameSkip===0){
-        const feat=packFeature(res);
-        if(feat) updateBuffer(feat);
+
+      if (frameCounter % frameSkip === 0) {
+        const feat = packFeature(res);
+        if (feat) updateBuffer(feat);
       }
-      if(Date.now()-captureStartMs>=CAPTURE_MS && !autoJudge){
-        autoJudge=true; setTimeout(function(){ stopAndPredict(); },120);
+
+      const elapsed = Date.now() - captureStartMs;
+
+      if (difficultySelect.value === "compound") {
+        if (elapsed >= BASE_CAPTURE_MS && autoJudge === false) {
+          // halfway
+          stopAndPredict(true);
+        } else if (elapsed >= BASE_CAPTURE_MS * 2 && autoJudge === "half_done") {
+          // final
+          stopAndPredict(false);
+        }
+      } else if (elapsed >= BASE_CAPTURE_MS && autoJudge === false) {
+        autoJudge = true;
+        setTimeout(() => stopAndPredict(), 80);
       }
     }
   });
@@ -568,21 +729,49 @@ window.addEventListener("load", () => {
   }
 
   const originalStart = () => {
-    if(!targetGesture){ alert('Select a gesture first.'); return; }
-    buf=[]; frameCounter=0; autoJudge=false; setState(STATE_PREP);
-    prepOverlay.style.display='block'; recBadge.style.display='none';
-    startBtn.style.display='none'; stopBtn.style.display='inline-block';
-    resultText.textContent='—'; capturePhase.textContent='Get Ready…'; running=true; camera.start();
-    timerBar.style.width='0%'; assistRow.style.display='none';
-    setTimeout(function(){
-      setState(STATE_CAPTURE); prepOverlay.style.display='none';
-      recBadge.style.display='inline-block'; capturePhase.textContent='Perform Now (~5 s)…';
-      captureStartMs=Date.now();
+    const diff = difficultySelect.value;
+
+    CAPTURE_MS = (diff === "compound") ? BASE_CAPTURE_MS * 2 : BASE_CAPTURE_MS;
+
+    if (diff === "random") {
+      targetGesture = pickRandomSign();
+      targetLabel.textContent = `${targetGesture} (Random)`;
+    } else if (diff === "compound") {
+      targetGesture = pickCompoundSign();
+      targetLabel.textContent = `${targetGesture} (Compound)`;
+    } else if (!targetGesture) {
+      alert("Select a gesture first.");
+      return;
+    }
+
+    buf = [];
+    frameCounter = 0;
+    autoJudge = false;         // VERY important for the timers
+    setState(STATE_PREP);
+
+    prepOverlay.style.display = "block";
+    recBadge.style.display = "none";
+    startBtn.style.display = "none";
+    stopBtn.style.display = "inline-block";
+    resultText.textContent = "—";
+    capturePhase.textContent = "Get Ready…";
+    running = true;
+    camera.start();
+    timerBar.style.width = "0%";
+    assistRow.style.display = "none";
+
+    setTimeout(function () {
+      setState(STATE_CAPTURE);
+      prepOverlay.style.display = "none";
+      recBadge.style.display = "inline-block";
+      capturePhase.textContent = (diff === "compound") ? "Perform first sign (~5 s)…" : "Perform Now (~5 s)…";
+      captureStartMs = Date.now();
     }, 1000);
   };
+
   startBtn.onclick = async () => { await stopPreviewIfAny(); originalStart(); };
 
-  const originalStop = async () => { await stopAndPredict(); };
+  const originalStop = async () => { await stopAndPredict(false); };
   stopBtn.onclick = async () => { await stopPreviewIfAny(); await originalStop(); };
 
   const originalReset = () => {
@@ -595,6 +784,7 @@ window.addEventListener("load", () => {
     capturePhase.textContent='Idle'; setState(STATE_READY);
     startBtn.style.display='inline-block'; stopBtn.style.display='none';
     scaleMultiplier=1.08; yOffset=-0.02; ghostPlaybackSpeed=0.5;
+    applyDifficultyUI(difficultySelect.value);
   };
   resetBtn.onclick = async () => { await stopPreviewIfAny(); originalReset(); };
 
